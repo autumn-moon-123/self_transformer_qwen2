@@ -102,3 +102,36 @@ class KVCache:
                 print("缓存为空")
             else:
                 print(f"层 {layer_idx} 缓存token数量: ", self.KCache[layer_idx].shape[-2])
+
+# Rope位置编码类
+class Rope:
+    def __init__(self, hidden_size, max_position_embeddings):
+        self.hidden_size = hidden_size
+        self.max_position_embeddings = max_position_embeddings
+        self.sin_matrix, self.cos_matrix = self.matrix
+
+    @property
+    def matrix(self):
+        seq_list = torch.arange(0, self.hidden_size, 2, dtype=torch.int64).float()
+        seq_list = seq_list / self.hidden_size
+        seq_list = 10000**seq_list
+        theta = 1.0 / seq_list
+        t = torch.arange(self.max_position_embeddings, dtype=torch.int64).type_as(theta)
+        freqs = torch.outer(t, theta)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        # 使用float32代替bfloat16，因为CPU对bfloat16支持有限
+        cos_val = emb.cos().to(torch.float32)
+        sin_val = emb.sin().to(torch.float32)
+        return sin_val, cos_val
+
+    def rotate_half(self, x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def apply_rotary_pos_emb(self, q, k, cos, sin, position_ids):
+        cos = cos[position_ids]
+        sin = sin[position_ids]
+        q_embed = (q * cos) + (self.rotate_half(q) * sin)
+        k_embed = (k * cos) + (self.rotate_half(k) * sin)
+        return q_embed, k_embed
