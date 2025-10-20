@@ -70,3 +70,35 @@ class Qwen2Generation:
         probs = torch.nn.functional.softmax(next_token_logits, dim=-1)
         next_token_id = torch.multinomial(probs, num_samples=1).squeeze(1)
         return next_token_id
+    
+# KV缓存类
+class KVCache:
+    def __init__(self) -> None:
+        self.KCache: List[torch.tensor] = []
+        self.VCache: List[torch.tensor] = []
+        self.verbose = False
+
+    def clear(self):
+        self.KCache = []
+        self.VCache = []
+
+    def update(self, new_key_states, new_value_states, layer_idx):
+        if len(self.KCache) <= layer_idx:
+            self.KCache.append(new_key_states)
+            self.VCache.append(new_value_states)
+        else:
+            self.KCache[layer_idx] = torch.cat([self.KCache[layer_idx], new_key_states], dim=-2)
+            self.VCache[layer_idx] = torch.cat([self.VCache[layer_idx], new_value_states], dim=-2)
+        return self.KCache[layer_idx], self.VCache[layer_idx]
+
+    def get_cached_length(self, layer_idx) -> int:
+        if len(self.KCache) <= layer_idx:
+            return 0
+        return self.KCache[layer_idx].shape[-2]
+
+    def print(self, layer_idx):
+        if self.verbose:
+            if len(self.KCache) == 0:
+                print("缓存为空")
+            else:
+                print(f"层 {layer_idx} 缓存token数量: ", self.KCache[layer_idx].shape[-2])
