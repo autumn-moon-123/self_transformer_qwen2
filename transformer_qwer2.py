@@ -135,3 +135,14 @@ class Rope:
         q_embed = (q * cos) + (self.rotate_half(q) * sin)
         k_embed = (k * cos) + (self.rotate_half(k) * sin)
         return q_embed, k_embed
+    
+# RMS归一化类
+class RmsNorm:
+    def __init__(self, eps):
+        self.eps = eps
+
+    def forward(self, states, weights):
+        states = states.to(torch.float32)
+        variance = states.pow(2).mean(-1, keepdim=True)
+        states = states * torch.rsqrt(variance + self.eps)
+        return weights * states.to(weights.dtype)
