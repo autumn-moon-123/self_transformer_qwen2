@@ -146,3 +146,176 @@ class RmsNorm:
         variance = states.pow(2).mean(-1, keepdim=True)
         states = states * torch.rsqrt(variance + self.eps)
         return weights * states.to(weights.dtype)
+    
+    
+# Qwen2模型类
+class Qwen2:
+    def __init__(self, max_new_tokens, verbose=False):
+        self.verbose = verbose
+        self.max_new_tokens = max_new_tokens
+        self.device = "cpu"  # 强制使用CPU
+
+        # 下载模型
+        print("正在加载模型: Qwen2-0.5B-Instruct...")
+        self._download_model()
+        print(f"模型加载完成! 使用设备: {self.device}")
+
+        # 初始化模型组件
+        self.feature_per_head = (int)(self.config.hidden_size / self.config.num_attention_heads)
+        self.groups = (int)(self.config.num_attention_heads / self.config.num_key_value_heads)
+        self.rope = Rope(self.feature_per_head, self.config.max_position_embeddings)
+        self.kv_cache = KVCache()
+        self.kv_cache.verbose = verbose
+        self.activation = RmsNorm(self.config.rms_norm_eps)
+
+    def _download_model(self):
+        try:
+            # 明确指定加载到CPU并使用float32
+            self.model = AutoModelForCausalLM.from_pretrained(
+                "Qwen/Qwen2-0.5B-Instruct",
+                torch_dtype=torch.float32,  # 使用float32而不是bfloat16
+                device_map=None,            # 不使用device_map
+                trust_remote_code=True
+            ).to("cpu")  # 显式移动到CPU
+        except Exception as e:
+            print(f"模型加载失败: {str(e)}")
+            sys.exit(1)
+
+        self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
+        self.config = self.model.config
+        generation_config = GenerationConfig.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
+        self.generation = Qwen2Generation(generation_config)
+
+    def apply_chat_template(self, prompt):
+        messages = [
+            {"role": "system", "content": "你是一个乐于助人的AI助手"},
+            {"role": "user", "content": prompt}
+        ]
+        return self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+
+    def embedding(self, input: str):
+        input_ids = self.tokenizer.encode(input, return_tensors="pt")
+        word_embeddings = torch.nn.functional.embedding(input_ids, self.model.model.embed_tokens.weight)
+        return input_ids, word_embeddings
+
+    def mlp(self, layer_idx, states):
+        gate_proj = torch.nn.functional.linear(states, self.model.model.layers[layer_idx].mlp.gate_proj.weight)
+        up_proj = torch.nn.functional.linear(states, self.model.model.layers[layer_idx].mlp.up_proj.weight)
+        down_proj = torch.nn.functional.linear(
+            torch.nn.functional.silu(gate_proj) * up_proj,
+            self.model.model.layers[layer_idx].mlp.down_proj.weight
+        )
+        return down_proj
+
+    def gqa(self, layer_idx, states, position_id):
+        seq_length = states.size()[-2]
+        query_states = torch.nn.functional.linear(
+            states,
+            self.model.model.layers[layer_idx].self_attn.q_proj.weight,
+            self.model.model.layers[layer_idx].self_attn.q_proj.bias,
+        )
+
+        key_states = torch.nn.functional.linear(
+            states,
+            self.model.model.layers[layer_idx].self_attn.k_proj.weight,
+            self.model.model.layers[layer_idx].self_attn.k_proj.bias,
+        )
+
+        value_states = torch.nn.functional.linear(
+            states,
+            self.model.model.layers[layer_idx].self_attn.v_proj.weight,
+            self.model.model.layers[layer_idx].self_attn.v_proj.bias,
+        )
+
+        query_states = query_states.view(1, seq_length, self.config.num_attention_heads, self.feature_per_head)
+
+        key_states = key_states.view(1, seq_length, self.config.num_key_value_heads, self.feature_per_head)
+        value_states = value_states.view(1, seq_length, self.config.num_key_value_heads, self.feature_per_head)
+
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        kv_cached_seq_len = seq_length + self.kv_cache.get_cached_length(layer_idx)
+        cos = self.rope.cos_matrix[:kv_cached_seq_len]
+        sin = self.rope.sin_matrix[:kv_cached_seq_len]
+        query_states, key_states = self.rope.apply_rotary_pos_emb(query_states, key_states, cos, sin, position_id)
+
+        key_states, value_states = self.kv_cache.update(key_states, value_states, layer_idx)
+        key_states = torch.repeat_interleave(key_states, repeats=self.groups, dim=1)
+        value_states = torch.repeat_interleave(value_states, repeats=self.groups, dim=1)
+        is_causal = seq_length > 1
+        attention_out = torch.nn.functional.scaled_dot_product_attention(
+            query_states, key_states, value_states, is_causal=is_causal
+        )
+        attention_out = attention_out.transpose(1, 2)
+        attention_out = attention_out.reshape(1, seq_length, self.config.hidden_size)
+        attn_out = torch.nn.functional.linear(attention_out, self.model.model.layers[layer_idx].self_attn.o_proj.weight)
+
+        return attn_out
+
+    def decoder_layer(self, layer_idx, states, position_id):
+        residual = states
+        states = self.activation.forward(states, self.model.model.layers[layer_idx].input_layernorm.weight)
+        states = self.gqa(layer_idx, states, position_id)
+        states = states + residual
+
+        residual = states
+        states = self.activation.forward(states, self.model.model.layers[layer_idx].post_attention_layernorm.weight)
+        states = self.mlp(layer_idx, states)
+        states = states + residual
+        return states
+
+    def module_forward(self, states, position_id):
+        for layer_idx in range(self.config.num_hidden_layers):
+            states = self.decoder_layer(layer_idx, states, position_id)
+
+        states = self.activation.forward(states, self.model.model.norm.weight)
+        return states
+
+    def lm_head(self, states):
+        last_hidden_state = states[:, -1, :]
+        logits = torch.nn.functional.linear(last_hidden_state, self.model.lm_head.weight)
+        return logits
+
+    def generate(self, user_input):
+        input_ids = None
+        position_id = None
+        text_len = 0
+
+        prompt = self.apply_chat_template(user_input)
+        answers = ""
+        self.kv_cache.clear()
+
+        for _ in range(self.max_new_tokens):
+            prompt_ids, embeddings = self.embedding(prompt)
+            input_ids = prompt_ids if input_ids is None else input_ids
+
+            if position_id is None:
+                text_len = prompt_ids.size()[-1]
+                position_id = torch.arange(text_len).reshape(1, text_len)
+            else:
+                position_id = torch.tensor([[text_len]])
+                text_len += 1
+
+            states = self.module_forward(embeddings, position_id)
+            logits = self.lm_head(states)
+            next_token_id = self.generation.next_token_id(logits, input_ids)
+            next_token = self.tokenizer.decode(next_token_id)
+            input_ids = torch.cat([input_ids, next_token_id[:, None]], dim=-1)
+
+            prompt = next_token
+
+            if self.generation.is_token_eos(next_token_id):
+                break
+
+            answers += next_token
+
+            if self.verbose:
+                print(f"下一个词: {next_token} (ID: {next_token_id})")
+
+        return answers
