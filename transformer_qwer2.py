@@ -147,7 +147,7 @@ class RmsNorm:
         states = states * torch.rsqrt(variance + self.eps)
         return weights * states.to(weights.dtype)
     
-    
+
 # Qwen2模型类
 class Qwen2:
     def __init__(self, max_new_tokens, verbose=False):
@@ -319,3 +319,68 @@ class Qwen2:
                 print(f"下一个词: {next_token} (ID: {next_token_id})")
 
         return answers
+    
+# 主函数
+def main():
+    print("=" * 50)
+    print("Qwen2-0.5B 模型运行器 (CPU优化版)")
+    print("=" * 50)
+
+    # 解析命令行参数
+    args = parse_args()
+
+    print(f"\n运行模型: Qwen2-0.5B-Instruct (设备: CPU)")
+
+    try:
+        # 初始化模型
+        model = Qwen2(
+            max_new_tokens=args.max_tokens,
+            verbose=args.verbose
+        )
+    except Exception as e:
+        print(f"模型初始化失败: {str(e)}")
+        return
+
+    # 如果有直接输入的提示词
+    if args.prompt:
+        print(f"\n提示词: {args.prompt}")
+        try:
+            response = model.generate(args.prompt)
+            print(f"\n回答: {response}")
+        except Exception as e:
+            print(f"生成回答时出错: {str(e)}")
+        return
+
+    # 对话循环
+    print("\n开始对话 (输入 'exit' 退出):")
+    while True:
+        try:
+            prompt = input("\n你: ")
+            if prompt.lower() == "exit":
+                break
+
+            response = model.generate(prompt)
+            print(f"\nAI: {response}")
+        except KeyboardInterrupt:
+            print("\n用户中断，退出程序")
+            break
+        except Exception as e:
+            print(f"生成回答时出错: {str(e)}")
+            print("尝试重新开始对话...")
+            model.kv_cache.clear()
+
+if __name__ == "__main__":
+    # 检查并安装依赖
+    try:
+        import torch
+        from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig
+    except ImportError:
+        print("正在安装所需依赖...")
+        os.system("pip install torch transformers")
+        print("依赖安装完成，请重新运行程序")
+        sys.exit(0)
+
+    # 设置PyTorch日志级别，减少输出
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+    main()
